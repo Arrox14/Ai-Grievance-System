@@ -1,17 +1,36 @@
-import { useState, useRef } from "react";
+import { useState, useRef, useEffect } from "react";
 import axios from "axios";
+import { useAuth } from "../context/AuthContext";
 
 export default function Upload() {
+  const { token } = useAuth();
   const [complaintText, setComplaintText] = useState("");
   const [file, setFile] = useState(null);
   const [location, setLocation] = useState(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [preview, setPreview] = useState(null);
-  const [stream, setStream] = useState(null);
   const [isCameraActive, setIsCameraActive] = useState(false);
+  const [isLiveDetecting, setIsLiveDetecting] = useState(false);
+  const [isLiveLoading, setIsLiveLoading] = useState(false);
+  const [liveError, setLiveError] = useState("");
+  const [liveDetections, setLiveDetections] = useState([]);
+  const [annotatedFrame, setAnnotatedFrame] = useState("");
   const [submissionResult, setSubmissionResult] = useState(null);
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
+  const streamRef = useRef(null);
+  const liveIntervalRef = useRef(null);
+  const liveActiveRef = useRef(false);
+  const liveSessionRef = useRef(0);
+  const inferenceInFlightRef = useRef(false);
+  const inferenceControllerRef = useRef(null);
+
+  useEffect(() => () => {
+    liveActiveRef.current = false;
+    clearInterval(liveIntervalRef.current);
+    inferenceControllerRef.current?.abort();
+    streamRef.current?.getTracks().forEach((track) => track.stop());
+  }, []);
 
   const getLocation = () => {
     if (navigator.geolocation) {
@@ -37,23 +56,112 @@ export default function Upload() {
       const mediaStream = await navigator.mediaDevices.getUserMedia({ 
         video: { facingMode: "environment" } 
       });
-      setStream(mediaStream);
+      streamRef.current = mediaStream;
       if (videoRef.current) {
         videoRef.current.srcObject = mediaStream;
       }
       setIsCameraActive(true);
+      return mediaStream;
     } catch (error) {
       console.error("Error accessing camera:", error);
       alert("Unable to access camera. Please check permissions.");
+      return null;
     }
   };
 
+  const stopLiveDetection = () => {
+    liveActiveRef.current = false;
+    liveSessionRef.current += 1;
+    clearInterval(liveIntervalRef.current);
+    liveIntervalRef.current = null;
+    inferenceControllerRef.current?.abort();
+    inferenceControllerRef.current = null;
+    setIsLiveDetecting(false);
+    setIsLiveLoading(false);
+  };
+
   const stopCamera = () => {
-    if (stream) {
-      stream.getTracks().forEach(track => track.stop());
-      setStream(null);
+    stopLiveDetection();
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
       setIsCameraActive(false);
     }
+  };
+
+  const analyzeLiveFrame = async (sessionId) => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!liveActiveRef.current || liveSessionRef.current !== sessionId ||
+        inferenceInFlightRef.current || !video || !canvas ||
+        !video.videoWidth || !video.videoHeight) {
+      return;
+    }
+
+    inferenceInFlightRef.current = true;
+    setIsLiveLoading(true);
+    const scale = Math.min(1, 640 / video.videoWidth, 480 / video.videoHeight);
+    canvas.width = Math.round(video.videoWidth * scale);
+    canvas.height = Math.round(video.videoHeight * scale);
+    canvas.getContext("2d").drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    try {
+      const frame = await new Promise((resolve, reject) => {
+        canvas.toBlob((blob) => {
+          if (blob) resolve(blob);
+          else reject(new Error("The camera frame could not be encoded."));
+        }, "image/jpeg", 0.65);
+      });
+      if (!liveActiveRef.current || liveSessionRef.current !== sessionId) return;
+
+      const formData = new FormData();
+      formData.append("file", frame, "camera-frame.jpg");
+      const controller = new AbortController();
+      inferenceControllerRef.current = controller;
+      const response = await axios.post("http://127.0.0.1:8000/live-detect", formData, {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: controller.signal
+      });
+      if (liveActiveRef.current && liveSessionRef.current === sessionId) {
+        setLiveDetections(response.data.detections);
+        setAnnotatedFrame(response.data.annotated_frame);
+        setLiveError("");
+      }
+    } catch (error) {
+      if (
+        error.name !== "CanceledError" &&
+        error.name !== "AbortError" &&
+        liveActiveRef.current &&
+        liveSessionRef.current === sessionId
+      ) {
+        console.error("Live camera inference failed:", error);
+        setLiveError(error.response?.data?.detail || "Live detection failed. Please try again.");
+      }
+    } finally {
+      inferenceControllerRef.current = null;
+      inferenceInFlightRef.current = false;
+      if (liveActiveRef.current && liveSessionRef.current === sessionId) {
+        setIsLiveLoading(false);
+      }
+    }
+  };
+
+  const startLiveDetection = async () => {
+    setLiveError("");
+    let mediaStream = streamRef.current;
+    if (!mediaStream) mediaStream = await startCamera();
+    if (!mediaStream) {
+      setLiveError("Camera access is required for live detection.");
+      return;
+    }
+    const sessionId = liveSessionRef.current + 1;
+    liveSessionRef.current = sessionId;
+    liveActiveRef.current = true;
+    setLiveDetections([]);
+    setAnnotatedFrame("");
+    setIsLiveDetecting(true);
+    analyzeLiveFrame(sessionId);
+    liveIntervalRef.current = setInterval(() => analyzeLiveFrame(sessionId), 1200);
   };
 
   const capturePhoto = () => {
@@ -112,13 +220,15 @@ export default function Upload() {
         formData,
         {
           headers: {
-            "Content-Type": "multipart/form-data"
+            "Content-Type": "multipart/form-data",
+            Authorization: `Bearer ${token}`,
           }
         }
       );
 
       // Store submission result to display
       setSubmissionResult(response.data);
+      window.dispatchEvent(new Event("pgis-notifications-changed"));
       
       // Reset form
       setComplaintText("");
@@ -261,6 +371,24 @@ export default function Upload() {
                   Capture Photo
                 </button>
               )}
+              {isCameraActive && (
+                <button
+                  type="button"
+                  onClick={isLiveDetecting ? stopCamera : startLiveDetection}
+                  disabled={isLiveLoading && !isLiveDetecting}
+                  style={{
+                    background: isLiveDetecting ? "#ef4444" : "#8b5cf6",
+                    color: "white",
+                    border: "none",
+                    padding: "0.75rem 1.5rem",
+                    borderRadius: "0.5rem",
+                    cursor: "pointer",
+                    fontWeight: "500"
+                  }}
+                >
+                  {isLiveDetecting ? "Stop Live Detection" : "Start Live Detection"}
+                </button>
+              )}
             </div>
             
             {isCameraActive && (
@@ -277,6 +405,37 @@ export default function Upload() {
                   }}
                 />
                 <canvas ref={canvasRef} style={{ display: "none" }} />
+              </div>
+            )}
+            {liveError && (
+              <div role="alert" style={{ color: "#fca5a5", marginBottom: "1rem" }}>
+                {liveError}
+              </div>
+            )}
+            {isLiveDetecting && (
+              <div style={{ marginBottom: "1rem", color: "#cbd5e1" }} aria-live="polite">
+                {isLiveLoading ? "Analyzing camera frame..." : "Live detection is active"}
+              </div>
+            )}
+            {annotatedFrame && (
+              <div style={{ marginBottom: "1rem" }}>
+                <img
+                  src={annotatedFrame}
+                  alt="Annotated live detections"
+                  style={{
+                    width: "100%",
+                    maxWidth: "400px",
+                    borderRadius: "0.5rem",
+                    border: "1px solid #475569"
+                  }}
+                />
+                <div style={{ color: "#cbd5e1", marginTop: "0.5rem" }}>
+                  {liveDetections.length
+                    ? liveDetections.map((detection) =>
+                      `${detection.class_name} (${Math.round(detection.confidence * 100)}%)`
+                    ).join(", ")
+                    : "No objects detected"}
+                </div>
               </div>
             )}
           </div>
